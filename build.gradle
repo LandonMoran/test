@@ -1,0 +1,2 @@
+// Root build file. Plugins are applied per-module in app/build.gradle,
+// with versions pinned via pluginManagement in settings.gradle.

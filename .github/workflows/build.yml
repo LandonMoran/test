@@ -1,0 +1,62 @@
+name: Build Debug APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Accept SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Upload debug APK (artifact)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: shizuku-stress-tester-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+
+      - name: Publish APK as a Release (one-tap phone download)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls app/build/outputs/apk/debug/*.apk | head -n1)
+          echo "Publishing $APK as release latest-debug"
+          gh release delete latest-debug --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest-debug "$APK" \
+            --target "$GITHUB_SHA" \
+            --title "Shizuku Stress Tester (debug)" \
+            --notes "Standalone app that hammers Shizuku's UserService bind/unbind as fast as possible and checks its own logcat for the #201 token-race signature.
+
+          First launch: grants Shizuku permission, then self-grants READ_LOGS via a one-shot privileged UserService, then closes itself - reopen the app afterward to see the Start button.
+
+          Debug-signed, not for daily use." \
+            --prerelease
