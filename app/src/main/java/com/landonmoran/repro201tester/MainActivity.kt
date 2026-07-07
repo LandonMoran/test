@@ -15,6 +15,7 @@ import android.os.Looper
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -26,17 +27,24 @@ class MainActivity : AppCompatActivity() {
     private lateinit var actionButton: Button
 
     private var testRunning = false
+    private var grantInProgress = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var grantTimeoutRunnable: Runnable? = null
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* best effort */ }
 
-    private val permissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+    private val permissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, _ ->
         if (requestCode == SHIZUKU_PERMISSION_REQUEST_CODE) {
             refresh()
         }
     }
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
+        runOnUiThread { refresh() }
+    }
+
+    private val binderDeadListener = Shizuku.OnBinderDeadListener {
         runOnUiThread { refresh() }
     }
 
@@ -68,6 +76,7 @@ class MainActivity : AppCompatActivity() {
 
         Shizuku.addRequestPermissionResultListener(permissionListener)
         Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
+        Shizuku.addBinderDeadListener(binderDeadListener)
 
         val filter = IntentFilter().apply {
             addAction(StressTestService.ACTION_PROGRESS)
@@ -91,17 +100,35 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        grantTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         Shizuku.removeRequestPermissionResultListener(permissionListener)
         unregisterReceiver(progressReceiver)
         super.onDestroy()
     }
 
+    /** True only if Shizuku's binder is alive right now - never trust a cached result. */
+    private fun isShizukuReady(): Boolean {
+        return try {
+            Shizuku.pingBinder()
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    private fun hasShizukuPermission(): Boolean {
+        return try {
+            isShizukuReady() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
     private fun refresh() {
-        if (testRunning) {
+        if (testRunning || grantInProgress) {
             return
         }
 
-        if (!Shizuku.pingBinder()) {
+        if (!isShizukuReady()) {
             statusText.text = "Shizuku isn't running. Start Shizuku, then tap Retry."
             actionButton.visibility = View.VISIBLE
             actionButton.text = "Retry"
@@ -109,11 +136,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+        if (!hasShizukuPermission()) {
             statusText.text = "This app needs Shizuku permission to run the stress test."
             actionButton.visibility = View.VISIBLE
             actionButton.text = "Grant Shizuku permission"
-            actionButton.setOnClickListener { Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE) }
+            actionButton.setOnClickListener { requestShizukuPermission() }
             return
         }
 
@@ -132,25 +159,98 @@ class MainActivity : AppCompatActivity() {
         actionButton.setOnClickListener { startStressTest() }
     }
 
+    private fun requestShizukuPermission() {
+        // Re-check right before acting - the UI state could be stale by the
+        // time the user actually taps the button.
+        if (!isShizukuReady()) {
+            Toast.makeText(this, "Shizuku isn't running anymore. Start it and tap Retry.", Toast.LENGTH_LONG).show()
+            refresh()
+            return
+        }
+        try {
+            Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Couldn't request permission: ${e.message}", Toast.LENGTH_LONG).show()
+            refresh()
+        }
+    }
+
     private fun grantReadLogsThenClose() {
+        if (grantInProgress) {
+            return
+        }
+
+        // Re-check right before starting - don't attempt this against a
+        // binder/permission state that might already be gone.
+        if (!hasShizukuPermission()) {
+            grantInProgress = false
+            refresh()
+            return
+        }
+
+        grantInProgress = true
+
         val args = Shizuku.UserServiceArgs(ComponentName(packageName, SetupService::class.java.name))
             .daemon(false)
             .processNameSuffix("setup")
             .tag("setup")
 
+        var finished = false
+
         val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, service: IBinder) {
-                Shizuku.unbindUserService(args, this, true)
+                if (finished) return
+                finished = true
+                grantTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+                try {
+                    Shizuku.unbindUserService(args, this, true)
+                } catch (e: Throwable) {
+                    // best effort - the record is torn down server-side regardless
+                }
+                grantInProgress = false
                 statusText.text = "Permission granted. Close and reopen the app."
-                Handler(Looper.getMainLooper()).postDelayed({ finishAndRemoveTask() }, 1500)
+                mainHandler.postDelayed({ finishAndRemoveTask() }, 1500)
             }
 
             override fun onServiceDisconnected(name: ComponentName) {}
         }
-        Shizuku.bindUserService(args, connection)
+
+        val timeout = Runnable {
+            if (finished) return@Runnable
+            finished = true
+            grantInProgress = false
+            try {
+                Shizuku.unbindUserService(args, connection, true)
+            } catch (e: Throwable) {
+                // best effort
+            }
+            statusText.text = "Couldn't grant log-read access (timed out). Make sure Shizuku is running, then retry."
+            actionButton.visibility = View.VISIBLE
+            actionButton.text = "Retry"
+            actionButton.setOnClickListener { refresh() }
+        }
+        grantTimeoutRunnable = timeout
+        mainHandler.postDelayed(timeout, GRANT_TIMEOUT_MS)
+
+        try {
+            Shizuku.bindUserService(args, connection)
+        } catch (e: Throwable) {
+            mainHandler.removeCallbacks(timeout)
+            grantInProgress = false
+            statusText.text = "Couldn't start the permission grant: ${e.message}"
+            actionButton.visibility = View.VISIBLE
+            actionButton.text = "Retry"
+            actionButton.setOnClickListener { refresh() }
+        }
     }
 
     private fun startStressTest() {
+        if (!hasShizukuPermission()) {
+            Toast.makeText(this, "Shizuku isn't ready anymore.", Toast.LENGTH_LONG).show()
+            refresh()
+            return
+        }
+
         testRunning = true
         statusText.text = "Starting…"
         actionButton.visibility = View.VISIBLE
@@ -172,5 +272,6 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val SHIZUKU_PERMISSION_REQUEST_CODE = 1001
+        private const val GRANT_TIMEOUT_MS = 6000L
     }
 }

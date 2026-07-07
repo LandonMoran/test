@@ -49,12 +49,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -n1)
+          APK_NAME=$(basename "$APK")
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-10)
           echo "Publishing $APK as release latest-debug"
           gh release delete latest-debug --yes --cleanup-tag 2>/dev/null || true
           gh release create latest-debug "$APK" \
             --target "$GITHUB_SHA" \
-            --title "Shizuku Stress Tester (debug)" \
+            --title "Shizuku Stress Tester (debug) - $APK_NAME" \
             --notes "Standalone app that hammers Shizuku's UserService bind/unbind as fast as possible and checks its own logcat for the #201 token-race signature.
+
+          Asset filename: $APK_NAME
+          Built from commit: $SHORT_SHA
 
           First launch: grants Shizuku permission, then self-grants READ_LOGS via a one-shot privileged UserService, then closes itself - reopen the app afterward to see the Start button.
 
