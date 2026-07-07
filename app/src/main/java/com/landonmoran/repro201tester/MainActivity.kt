@@ -7,11 +7,14 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
@@ -28,6 +31,7 @@ class MainActivity : AppCompatActivity() {
 
     private var testRunning = false
     private var grantInProgress = false
+    private var batteryPromptDismissed = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var grantTimeoutRunnable: Runnable? = null
 
@@ -64,6 +68,15 @@ class MainActivity : AppCompatActivity() {
                     actionButton.text = "Run again"
                     actionButton.setOnClickListener { startStressTest() }
                 }
+                StressTestService.ACTION_HALTED -> {
+                    val n = intent.getIntExtra(StressTestService.EXTRA_ITERATION, 0)
+                    val reason = intent.getStringExtra(StressTestService.EXTRA_REASON)
+                    testRunning = false
+                    statusText.text = "Stopped: connection lost after $n confirmed iterations.\n$reason"
+                    actionButton.visibility = View.VISIBLE
+                    actionButton.text = "Retry"
+                    actionButton.setOnClickListener { refresh() }
+                }
             }
         }
     }
@@ -81,6 +94,7 @@ class MainActivity : AppCompatActivity() {
         val filter = IntentFilter().apply {
             addAction(StressTestService.ACTION_PROGRESS)
             addAction(StressTestService.ACTION_RESULT)
+            addAction(StressTestService.ACTION_HALTED)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(progressReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -96,6 +110,13 @@ class MainActivity : AppCompatActivity() {
             notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        refresh()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Coming back from Shizuku, the battery-optimization settings screen,
+        // or just switching apps - the live state may have changed underneath us.
         refresh()
     }
 
@@ -121,6 +142,11 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Throwable) {
             false
         }
+    }
+
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        val pm = getSystemService(PowerManager::class.java) ?: return true
+        return pm.isIgnoringBatteryOptimizations(packageName)
     }
 
     private fun refresh() {
@@ -150,6 +176,18 @@ class MainActivity : AppCompatActivity() {
             statusText.text = "Granting this app log-read access via Shizuku…"
             actionButton.visibility = View.GONE
             grantReadLogsThenClose()
+            return
+        }
+
+        // Best-effort: the foreground service already keeps the loop itself
+        // running, but exempting from Doze/App Standby avoids the process
+        // being frozen or throttled between cycles on aggressive OEM ROMs.
+        if (!batteryPromptDismissed && !isIgnoringBatteryOptimizations()) {
+            statusText.text = "For best results, exempt this app from battery optimization " +
+                "(some ROMs throttle background work even during a foreground service)."
+            actionButton.visibility = View.VISIBLE
+            actionButton.text = "Exempt from battery optimization"
+            actionButton.setOnClickListener { requestIgnoreBatteryOptimizations() }
             return
         }
 
@@ -241,6 +279,21 @@ class MainActivity : AppCompatActivity() {
             actionButton.visibility = View.VISIBLE
             actionButton.text = "Retry"
             actionButton.setOnClickListener { refresh() }
+        }
+    }
+
+    private fun requestIgnoreBatteryOptimizations() {
+        // Only ask once per session - if the user declines the system dialog,
+        // don't trap them behind this screen forever.
+        batteryPromptDismissed = true
+        try {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(Uri.parse("package:$packageName"))
+            startActivity(intent)
+        } catch (e: Throwable) {
+            // Not all OEM skins expose this dialog - don't block the user on it.
+            Toast.makeText(this, "Couldn't open battery settings; continuing without the exemption.", Toast.LENGTH_LONG).show()
+            refresh()
         }
     }
 

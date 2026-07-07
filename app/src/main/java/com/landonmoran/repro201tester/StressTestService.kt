@@ -18,7 +18,9 @@ import java.io.InputStreamReader
  * Foreground service that repeatedly binds/unbinds a throwaway UserService as
  * fast as possible, and after each cycle checks its own logcat (via the
  * READ_LOGS permission granted by SetupService) for the #201 token-race
- * signature. Stops and notifies on a match, or if manually stopped.
+ * signature. Stops and notifies on a match, on a lost Shizuku connection, or
+ * if manually stopped - it never keeps "running" once the underlying calls
+ * stop actually reaching Shizuku.
  */
 class StressTestService : Service() {
 
@@ -44,7 +46,7 @@ class StressTestService : Service() {
         running = true
 
         createChannel()
-        startForeground(NOTIF_ID, buildProgressNotification(0))
+        startForeground(NOTIF_ID, buildProgressNotification(0, 0))
 
         Thread { runLoop() }.start()
 
@@ -69,33 +71,79 @@ class StressTestService : Service() {
             .tag("stress")
 
         var iteration = 0
+        var confirmedIteration = 0
+        var consecutiveFailures = 0
+
         while (running) {
             iteration++
+
+            // Verify the connection is actually alive BEFORE spending a cycle
+            // on it - a dead binder here means every subsequent bind/unbind
+            // is a no-op, and we'd otherwise just spin counting fake
+            // iterations forever with no way to tell the difference (exactly
+            // the "spam it and get 0=0=0" blind spot the shell-broadcast
+            // approach had).
+            if (!isShizukuAlive()) {
+                haltForLostConnection(confirmedIteration, "Shizuku connection went away")
+                return
+            }
+
+            var cycleOk = true
             try {
                 Shizuku.bindUserService(args, noopConnection)
                 Thread.sleep(150)
                 Shizuku.unbindUserService(args, noopConnection, true)
             } catch (e: Throwable) {
-                // A bind/unbind hiccup here isn't itself the signal we're
-                // hunting for; keep looping and let the log check judge it.
+                cycleOk = false
+            }
+
+            if (cycleOk) {
+                confirmedIteration = iteration
+                consecutiveFailures = 0
+            } else {
+                consecutiveFailures++
+                if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                    haltForLostConnection(
+                        confirmedIteration,
+                        "$MAX_CONSECUTIVE_FAILURES bind/unbind calls in a row failed"
+                    )
+                    return
+                }
             }
 
             val hit = checkForSignature()
             if (hit != null) {
                 running = false
-                broadcastResult(iteration, hit)
-                showResultNotification(iteration, hit)
+                broadcastResult(confirmedIteration, hit)
+                showResultNotification(confirmedIteration, hit)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return
             }
 
             if (iteration % 5 == 0) {
-                broadcastProgress(iteration)
-                updateProgressNotification(iteration)
+                broadcastProgress(confirmedIteration, iteration)
+                updateProgressNotification(confirmedIteration, iteration)
             }
         }
 
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /** Cheap local check - not a round trip, just pings the already-held binder. */
+    private fun isShizukuAlive(): Boolean {
+        return try {
+            Shizuku.pingBinder()
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    private fun haltForLostConnection(confirmedIteration: Int, reason: String) {
+        running = false
+        broadcastHalted(confirmedIteration, reason)
+        showHaltedNotification(confirmedIteration, reason)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -121,8 +169,11 @@ class StressTestService : Service() {
         }
     }
 
-    private fun broadcastProgress(iteration: Int) {
-        val intent = Intent(ACTION_PROGRESS).setPackage(packageName).putExtra(EXTRA_ITERATION, iteration)
+    private fun broadcastProgress(confirmedIteration: Int, attempted: Int) {
+        val intent = Intent(ACTION_PROGRESS)
+            .setPackage(packageName)
+            .putExtra(EXTRA_ITERATION, confirmedIteration)
+            .putExtra(EXTRA_ATTEMPTED, attempted)
         sendBroadcast(intent)
     }
 
@@ -134,6 +185,14 @@ class StressTestService : Service() {
         sendBroadcast(intent)
     }
 
+    private fun broadcastHalted(confirmedIteration: Int, reason: String) {
+        val intent = Intent(ACTION_HALTED)
+            .setPackage(packageName)
+            .putExtra(EXTRA_ITERATION, confirmedIteration)
+            .putExtra(EXTRA_REASON, reason)
+        sendBroadcast(intent)
+    }
+
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(CHANNEL_ID, "Stress test", NotificationManager.IMPORTANCE_LOW)
@@ -141,22 +200,28 @@ class StressTestService : Service() {
         }
     }
 
-    private fun buildProgressNotification(iteration: Int): Notification {
+    private fun buildProgressNotification(confirmedIteration: Int, attempted: Int): Notification {
+        val text = if (attempted > confirmedIteration) {
+            "Confirmed $confirmedIteration (attempted $attempted)"
+        } else {
+            "Confirmed $confirmedIteration"
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Stress test running")
-            .setContentText("Iteration $iteration")
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_popup_sync)
             .setOngoing(true)
             .build()
     }
 
-    private fun updateProgressNotification(iteration: Int) {
-        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildProgressNotification(iteration))
+    private fun updateProgressNotification(confirmedIteration: Int, attempted: Int) {
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIF_ID, buildProgressNotification(confirmedIteration, attempted))
     }
 
     private fun showResultNotification(iteration: Int, matchedLine: String) {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Race hit after $iteration iterations")
+            .setContentTitle("Race hit after $iteration confirmed iterations")
             .setContentText(matchedLine)
             .setStyle(NotificationCompat.BigTextStyle().bigText(matchedLine))
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
@@ -165,14 +230,29 @@ class StressTestService : Service() {
         getSystemService(NotificationManager::class.java).notify(NOTIF_ID + 1, notification)
     }
 
+    private fun showHaltedNotification(confirmedIteration: Int, reason: String) {
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Stress test stopped: connection lost")
+            .setContentText("$reason after $confirmedIteration confirmed iterations")
+            .setStyle(NotificationCompat.BigTextStyle().bigText("$reason after $confirmedIteration confirmed iterations"))
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID + 2, notification)
+    }
+
     companion object {
         const val ACTION_STOP = "com.landonmoran.repro201tester.STOP"
         const val ACTION_PROGRESS = "com.landonmoran.repro201tester.PROGRESS"
         const val ACTION_RESULT = "com.landonmoran.repro201tester.RESULT"
+        const val ACTION_HALTED = "com.landonmoran.repro201tester.HALTED"
         const val EXTRA_ITERATION = "iteration"
+        const val EXTRA_ATTEMPTED = "attempted"
         const val EXTRA_MATCH = "match"
+        const val EXTRA_REASON = "reason"
 
         private const val CHANNEL_ID = "stress_test"
         private const val NOTIF_ID = 42
+        private const val MAX_CONSECUTIVE_FAILURES = 3
     }
 }
