@@ -11,6 +11,16 @@
          so this entry has to exist even though it's a signature-level permission. -->
     <uses-permission android:name="android.permission.READ_LOGS" tools:ignore="ProtectedPermissions" />
 
+    <!-- Android 11+ (API 30+) package visibility: a Shizuku client must declare the
+         manager package to be able to see and message it. Without this the app and
+         the manager are mutually AppsFilter-BLOCKED, the REQUEST_BINDER broadcast
+         that starts the Shizuku handshake is filtered out, and the app never
+         receives the binder (so bindUserService can never run). This is the
+         documented requirement for Shizuku clients targeting API 30+. -->
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
     <application
         android:allowBackup="false"
         android:icon="@drawable/ic_launcher"
