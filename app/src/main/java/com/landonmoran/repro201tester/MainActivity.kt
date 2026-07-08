@@ -32,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private var testRunning = false
     private var grantInProgress = false
     private var batteryPromptDismissed = false
+    private var logAccessState = LogAccessState.UNKNOWN
     private val mainHandler = Handler(Looper.getMainLooper())
     private var grantTimeoutRunnable: Runnable? = null
 
@@ -149,6 +150,22 @@ class MainActivity : AppCompatActivity() {
         return pm.isIgnoringBatteryOptimizations(packageName)
     }
 
+    /** Actually invokes logcat rather than trusting the permission grant alone - the
+     *  interactive "allow log access" system dialog (if the device shows one) blocks
+     *  real reads regardless of what checkSelfPermission reports. */
+    private fun canReadLogs(): Boolean {
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "5"))
+            val hasOutput = process.inputStream.bufferedReader().readLine() != null
+            process.waitFor()
+            hasOutput
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    private enum class LogAccessState { UNKNOWN, CHECKING, CONFIRMED, BLOCKED }
+
     private fun refresh() {
         if (testRunning || grantInProgress) {
             return
@@ -177,6 +194,46 @@ class MainActivity : AppCompatActivity() {
             actionButton.visibility = View.GONE
             grantReadLogsThenClose()
             return
+        }
+
+        // The READ_LOGS grant above isn't the whole story: Android also gates
+        // actually reading logs behind a separate, interactive system dialog
+        // ("Allow this app to read the system log?") that no permission grant
+        // can pre-approve - it has to be tapped live. Probe for it here, with
+        // the user watching, instead of finding out mid-stress-test that logcat
+        // reads are silently coming back empty.
+        when (logAccessState) {
+            LogAccessState.CONFIRMED -> { /* fall through */ }
+            LogAccessState.CHECKING -> {
+                statusText.text = "Checking device log access…"
+                actionButton.visibility = View.GONE
+                return
+            }
+            LogAccessState.UNKNOWN -> {
+                logAccessState = LogAccessState.CHECKING
+                statusText.text = "Checking device log access…"
+                actionButton.visibility = View.GONE
+                Thread {
+                    val ok = canReadLogs()
+                    mainHandler.post {
+                        logAccessState = if (ok) LogAccessState.CONFIRMED else LogAccessState.BLOCKED
+                        refresh()
+                    }
+                }.start()
+                return
+            }
+            LogAccessState.BLOCKED -> {
+                statusText.text = "Couldn't read device logs yet. Android may be showing a system dialog asking " +
+                    "to allow this app to read the log - look for it and tap Allow (this is separate from the " +
+                    "Shizuku permission already granted), then tap Retry."
+                actionButton.visibility = View.VISIBLE
+                actionButton.text = "Retry"
+                actionButton.setOnClickListener {
+                    logAccessState = LogAccessState.UNKNOWN
+                    refresh()
+                }
+                return
+            }
         }
 
         // Best-effort: the foreground service already keeps the loop itself

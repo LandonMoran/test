@@ -89,12 +89,14 @@ class StressTestService : Service() {
             }
 
             var cycleOk = true
+            var lastFailure: String? = null
             try {
                 Shizuku.bindUserService(args, noopConnection)
                 Thread.sleep(150)
                 Shizuku.unbindUserService(args, noopConnection, true)
             } catch (e: Throwable) {
                 cycleOk = false
+                lastFailure = "${e.javaClass.simpleName}: ${e.message}"
             }
 
             if (cycleOk) {
@@ -105,7 +107,7 @@ class StressTestService : Service() {
                 if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
                     haltForLostConnection(
                         confirmedIteration,
-                        "$MAX_CONSECUTIVE_FAILURES bind/unbind calls in a row failed"
+                        "$MAX_CONSECUTIVE_FAILURES bind/unbind calls in a row failed - last error: $lastFailure"
                     )
                     return
                 }
