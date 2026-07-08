@@ -246,8 +246,23 @@ class MainActivity : AppCompatActivity() {
                     // best effort - the record is torn down server-side regardless
                 }
                 grantInProgress = false
-                statusText.text = "Permission granted. Close and reopen the app."
-                mainHandler.postDelayed({ finishAndRemoveTask() }, 1500)
+
+                // The UserService's `pm grant` runs in a separate process and
+                // swallows its own errors, so the only trustworthy signal is
+                // checking the permission from here. Don't assume success and
+                // close - that's what turns a real failure into an infinite
+                // "granted! close and reopen" loop.
+                val actuallyGranted = ContextCompat.checkSelfPermission(this@MainActivity, "android.permission.READ_LOGS") ==
+                    PackageManager.PERMISSION_GRANTED
+                if (actuallyGranted) {
+                    statusText.text = "Permission granted. Close and reopen the app."
+                    mainHandler.postDelayed({ finishAndRemoveTask() }, 1500)
+                } else {
+                    statusText.text = "Grant didn't take. Make sure Shizuku is running as root/adb shell, then retry."
+                    actionButton.visibility = View.VISIBLE
+                    actionButton.text = "Retry"
+                    actionButton.setOnClickListener { refresh() }
+                }
             }
 
             override fun onServiceDisconnected(name: ComponentName) {}
