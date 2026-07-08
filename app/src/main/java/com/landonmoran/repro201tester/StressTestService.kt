@@ -12,7 +12,12 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import rikka.shizuku.Shizuku
 import java.io.BufferedReader
+import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStreamReader
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Foreground service that repeatedly binds/unbinds a throwaway UserService as
@@ -21,6 +26,10 @@ import java.io.InputStreamReader
  * signature. Stops and notifies on a match, on a lost Shizuku connection, or
  * if manually stopped - it never keeps "running" once the underlying calls
  * stop actually reaching Shizuku.
+ *
+ * Results are also appended to a plain file (RESULT_LOG_FILENAME) so there's
+ * a persistent, independently-checkable record that survives an app crash -
+ * not just an in-memory counter you have to take on faith.
  */
 class StressTestService : Service() {
 
@@ -31,6 +40,9 @@ class StressTestService : Service() {
         override fun onServiceConnected(name: ComponentName, service: IBinder) {}
         override fun onServiceDisconnected(name: ComponentName) {}
     }
+
+    private val logTimeFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+    private val fileTimeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -59,11 +71,10 @@ class StressTestService : Service() {
     }
 
     private fun runLoop() {
-        try {
-            Runtime.getRuntime().exec(arrayOf("logcat", "-c")).waitFor()
-        } catch (e: Exception) {
-            // non-fatal; the signature check below just has more history to scan
-        }
+        clearLogBuffer()
+        var lastLogCheckTime = logTimeFormat.format(Date())
+
+        appendResultLog("=== Stress test started ===")
 
         val args = Shizuku.UserServiceArgs(ComponentName(packageName, StressService::class.java.name))
             .daemon(false)
@@ -76,6 +87,15 @@ class StressTestService : Service() {
 
         while (running) {
             iteration++
+
+            // Periodically clear the log buffer outright rather than relying
+            // solely on the incremental "-T" reads below - belt and suspenders
+            // against ever letting the buffer (and each read's cost) grow
+            // unbounded over a run of thousands of iterations.
+            if (iteration % ITERATIONS_PER_LOG_CLEAR == 0) {
+                clearLogBuffer()
+                lastLogCheckTime = logTimeFormat.format(Date())
+            }
 
             // Verify the connection is actually alive BEFORE spending a cycle
             // on it - a dead binder here means every subsequent bind/unbind
@@ -105,6 +125,7 @@ class StressTestService : Service() {
             } else {
                 consecutiveFailures++
                 if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                    appendResultLog("Halted after $confirmedIteration confirmed iterations - $MAX_CONSECUTIVE_FAILURES bind/unbind calls in a row failed - last error: $lastFailure")
                     haltForLostConnection(
                         confirmedIteration,
                         "$MAX_CONSECUTIVE_FAILURES bind/unbind calls in a row failed - last error: $lastFailure"
@@ -113,9 +134,18 @@ class StressTestService : Service() {
                 }
             }
 
-            val hit = checkForSignature()
+            // Only read what's new since the last check instead of dumping the
+            // whole buffer every cycle - that read only gets more expensive as
+            // the buffer fills, and at one bind/unbind cycle per ~150ms, doing
+            // a full dump every time is what actually bogged the device down
+            // over a few thousand iterations.
+            val checkStartTime = Date()
+            val hit = checkForSignature(lastLogCheckTime)
+            lastLogCheckTime = logTimeFormat.format(checkStartTime)
+
             if (hit != null) {
                 running = false
+                appendResultLog("HIT after $confirmedIteration confirmed iterations: $hit")
                 broadcastResult(confirmedIteration, hit)
                 showResultNotification(confirmedIteration, hit)
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -123,12 +153,14 @@ class StressTestService : Service() {
                 return
             }
 
-            if (iteration % 5 == 0) {
+            if (iteration % PROGRESS_INTERVAL == 0) {
                 broadcastProgress(confirmedIteration, iteration)
                 updateProgressNotification(confirmedIteration, iteration)
+                appendResultLog("confirmed=$confirmedIteration attempted=$iteration")
             }
         }
 
+        appendResultLog("=== Stopped (manual) after $confirmedIteration confirmed iterations ===")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -150,9 +182,17 @@ class StressTestService : Service() {
         stopSelf()
     }
 
-    private fun checkForSignature(): String? {
+    private fun clearLogBuffer() {
+        try {
+            Runtime.getRuntime().exec(arrayOf("logcat", "-c")).waitFor()
+        } catch (e: Exception) {
+            // non-fatal; the signature check below just has more history to scan
+        }
+    }
+
+    private fun checkForSignature(sinceTime: String): String? {
         return try {
-            val process = Runtime.getRuntime().exec(arrayOf("logcat", "-d"))
+            val process = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-T", sinceTime))
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             var match: String? = null
             reader.forEachLine { line ->
@@ -168,6 +208,17 @@ class StressTestService : Service() {
             match
         } catch (e: Exception) {
             null
+        }
+    }
+
+    /** Plain-file, independently-checkable record - not just an in-memory counter. */
+    private fun appendResultLog(line: String) {
+        try {
+            FileOutputStream(File(filesDir, RESULT_LOG_FILENAME), true).use {
+                it.write("${fileTimeFormat.format(Date())}  $line\n".toByteArray())
+            }
+        } catch (e: Exception) {
+            // best effort - losing a log line isn't worth crashing the test over
         }
     }
 
@@ -253,8 +304,12 @@ class StressTestService : Service() {
         const val EXTRA_MATCH = "match"
         const val EXTRA_REASON = "reason"
 
+        const val RESULT_LOG_FILENAME = "stress_results.log"
+
         private const val CHANNEL_ID = "stress_test"
         private const val NOTIF_ID = 42
         private const val MAX_CONSECUTIVE_FAILURES = 3
+        private const val PROGRESS_INTERVAL = 5
+        private const val ITERATIONS_PER_LOG_CLEAR = 2000
     }
 }

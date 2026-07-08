@@ -22,12 +22,15 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import rikka.shizuku.Shizuku
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private lateinit var actionButton: Button
+    private lateinit var shareLogButton: Button
 
     private var testRunning = false
     private var grantInProgress = false
@@ -55,6 +58,7 @@ class MainActivity : AppCompatActivity() {
 
     private val progressReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            updateShareLogButtonVisibility()
             when (intent.action) {
                 StressTestService.ACTION_PROGRESS -> {
                     val n = intent.getIntExtra(StressTestService.EXTRA_ITERATION, 0)
@@ -87,6 +91,8 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         statusText = findViewById(R.id.statusText)
         actionButton = findViewById(R.id.actionButton)
+        shareLogButton = findViewById(R.id.shareLogButton)
+        shareLogButton.setOnClickListener { shareLogFile() }
 
         Shizuku.addRequestPermissionResultListener(permissionListener)
         Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
@@ -166,7 +172,33 @@ class MainActivity : AppCompatActivity() {
 
     private enum class LogAccessState { UNKNOWN, CHECKING, CONFIRMED, BLOCKED }
 
+    private fun updateShareLogButtonVisibility() {
+        shareLogButton.visibility =
+            if (File(filesDir, StressTestService.RESULT_LOG_FILENAME).exists()) View.VISIBLE else View.GONE
+    }
+
+    private fun shareLogFile() {
+        val file = File(filesDir, StressTestService.RESULT_LOG_FILENAME)
+        if (!file.exists()) {
+            Toast.makeText(this, "No results log yet - run the stress test first.", Toast.LENGTH_LONG).show()
+            return
+        }
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, "Share stress test results"))
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Couldn't share log: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
     private fun refresh() {
+        updateShareLogButtonVisibility()
+
         if (testRunning || grantInProgress) {
             return
         }

@@ -21,4 +21,12 @@
         android:layout_height="wrap_content"
         android:text="Please wait…" />
 
+    <Button
+        android:id="@+id/shareLogButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="Share results log"
+        android:visibility="gone" />
+
 </LinearLayout>
