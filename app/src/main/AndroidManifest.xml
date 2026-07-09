@@ -35,9 +35,13 @@
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
+        <!-- exported="true" is HARNESS-ONLY: the headless CI test starts this
+             service from adb shell (a different uid), which Android blocks for a
+             non-exported service. The production app starts it from its own
+             MainActivity and does not need it exported. -->
         <service
             android:name=".StressTestService"
-            android:exported="false"
+            android:exported="true"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
