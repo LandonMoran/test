@@ -128,23 +128,25 @@ class StressTestService : Service() {
                 appendResultLog("droprebind A bind/unbind threw: ${e.javaClass.simpleName}: ${e.message}")
             }
 
-            // 4: immediately rebind B and require it to connect. This is the record
-            // that gets stranded on the baseline. verifiedProbe retries a few times
-            // (the fix's respawn may take a moment); never connecting is the bug.
-            when (verifiedProbe(args, "droprebind")) {
-                Probe.CONNECTED -> connected++
-                Probe.RECOVERED -> { connected++; recovered++ }
-                Probe.HARD_FAIL -> {
-                    reportHardFail(churn,
-                        "rebind after unbind(remove=true) of an in-flight failed spawn never connected " +
-                            "($RECOVERY_RETRIES retries) - record was dropped with a waiter attached",
-                        "churn=$churn connected=$connected ($recovered needed retry)")
-                    return
-                }
-                Probe.LOST -> {
-                    halt(churn, "churn=$churn connected=$connected", "Shizuku connection lost")
-                    return
-                }
+            // 4: immediately rebind B as a SINGLE verified bind with a generous
+            // timeout. Deliberately not verifiedProbe: its retries do a *fresh*
+            // bind, which mints a new record/token and would connect normally -
+            // masking the exact strand under test. The whole point is that THIS
+            // rebind, which reused the still-starting record as a waiter, must
+            // itself connect. The timeout is long enough for the fix's respawn to
+            // finish; the baseline never connects because the record was dropped.
+            if (!isShizukuAlive()) {
+                halt(churn, "churn=$churn connected=$connected", "Shizuku connection lost")
+                return
+            }
+            if (verifiedBind(args, DROPREBIND_CONNECT_TIMEOUT_MS)) {
+                connected++
+            } else {
+                reportHardFail(churn,
+                    "rebind after unbind(remove=true) of an in-flight failed spawn never connected " +
+                        "within ${DROPREBIND_CONNECT_TIMEOUT_MS}ms - record was dropped with a waiter attached",
+                    "churn=$churn connected=$connected")
+                return
             }
 
             if (churn % PROGRESS_INTERVAL == 0) {
@@ -564,5 +566,9 @@ class StressTestService : Service() {
         // between bind A and unbind(remove=true) A, so the rebind B lands while the
         // record is still "starting" and takes the reuse path.
         private const val DROPREBIND_INFLIGHT_MS = 300L
+        // Generous single-shot connect timeout for rebind B: long enough for the
+        // fixed server's respawn to boot a process and attach; the baseline never
+        // connects regardless because the record was dropped.
+        private const val DROPREBIND_CONNECT_TIMEOUT_MS = 12000L
     }
 }
