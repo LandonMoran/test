@@ -149,11 +149,14 @@ class StressTestService : Service() {
                 return
             }
 
+            // Log churn every iteration: the drop-rebind loop is slow (~3s/cycle,
+            // dominated by the forced-fail delay), so a coarse interval would leave
+            // the result file with no churn= line for the harness to read.
+            val s = "churn=$churn connected=$connected"
+            appendResultLog(s)
             if (churn % PROGRESS_INTERVAL == 0) {
-                val s = "churn=$churn connected=$connected ($recovered needed retry)"
                 broadcastProgress(churn, s)
                 updateProgressNotification(s)
-                appendResultLog(s)
             }
         }
 
