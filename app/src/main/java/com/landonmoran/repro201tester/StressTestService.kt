@@ -70,12 +70,94 @@ class StressTestService : Service() {
         }
         running = true
 
+        val mode = intent?.getStringExtra(EXTRA_MODE)
+
         createChannel()
         startForeground(NOTIF_ID, buildProgressNotification("Starting…"))
 
-        Thread { runLoop() }.start()
+        if (mode == MODE_DROPREBIND) {
+            Thread { runDropRebindLoop() }.start()
+        } else {
+            Thread { runLoop() }.start()
+        }
 
         return START_NOT_STICKY
+    }
+
+    /**
+     * Drives the drop-vs-rebind finding: a spawn that fails while a rebind is
+     * already waiting on the same record. Each iteration:
+     *   1. bind A (schedules the server spawn, which the harness forces to
+     *      fail-once via SHIZUKU_REPRO_FORCE_SPAWN_FAIL);
+     *   2. brief delay so the forced spawn is still in flight;
+     *   3. unbind(remove=true) A -> the record is marked pendingDestroy but the
+     *      in-flight spawn is untouched;
+     *   4. immediately bind B (verifiedBind) - it REUSES the same still-starting
+     *      record and registers as a waiter, then the forced spawn fails.
+     * On the BASELINE server dropRecordIfNotAttachedLocked evicts the record and B
+     * is stranded (never connects) -> HARD FAILURE. On the FIXED server the failed
+     * record still has B waiting, so it respawns and B connects -> clean/RECOVERED.
+     */
+    private fun runDropRebindLoop() {
+        appendResultLog("=== Stress test started (drop-rebind mode) ===")
+        val args = argsFor("droprebind")
+
+        var churn = 0
+        var connected = 0
+        var recovered = 0
+
+        while (running) {
+            if (!isShizukuAlive()) {
+                halt(churn, "churn=$churn connected=$connected", "Shizuku connection went away")
+                return
+            }
+
+            churn++
+
+            // 1-3: bind A, let the (forced-failing) spawn get in flight, then
+            // unbind(remove=true) while it is still starting.
+            try {
+                val connA = object : ServiceConnection {
+                    override fun onServiceConnected(name: ComponentName, service: IBinder) {}
+                    override fun onServiceDisconnected(name: ComponentName) {}
+                }
+                Shizuku.bindUserService(args, connA)
+                Thread.sleep(DROPREBIND_INFLIGHT_MS)
+                Shizuku.unbindUserService(args, connA, true)
+            } catch (e: Throwable) {
+                appendResultLog("droprebind A bind/unbind threw: ${e.javaClass.simpleName}: ${e.message}")
+            }
+
+            // 4: immediately rebind B and require it to connect. This is the record
+            // that gets stranded on the baseline. verifiedProbe retries a few times
+            // (the fix's respawn may take a moment); never connecting is the bug.
+            when (verifiedProbe(args, "droprebind")) {
+                Probe.CONNECTED -> connected++
+                Probe.RECOVERED -> { connected++; recovered++ }
+                Probe.HARD_FAIL -> {
+                    reportHardFail(churn,
+                        "rebind after unbind(remove=true) of an in-flight failed spawn never connected " +
+                            "($RECOVERY_RETRIES retries) - record was dropped with a waiter attached",
+                        "churn=$churn connected=$connected ($recovered needed retry)")
+                    return
+                }
+                Probe.LOST -> {
+                    halt(churn, "churn=$churn connected=$connected", "Shizuku connection lost")
+                    return
+                }
+            }
+
+            if (churn % PROGRESS_INTERVAL == 0) {
+                val s = "churn=$churn connected=$connected ($recovered needed retry)"
+                broadcastProgress(churn, s)
+                updateProgressNotification(s)
+                appendResultLog(s)
+            }
+        }
+
+        appendResultLog("=== Stopped (manual). churn=$churn connected=$connected ===")
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     override fun onDestroy() {
@@ -460,6 +542,8 @@ class StressTestService : Service() {
         const val EXTRA_ATTEMPTED = "attempted"
         const val EXTRA_MATCH = "match"
         const val EXTRA_REASON = "reason"
+        const val EXTRA_MODE = "mode"
+        const val MODE_DROPREBIND = "droprebind"
 
         const val RESULT_LOG_FILENAME = "stress_results.log"
 
@@ -476,5 +560,9 @@ class StressTestService : Service() {
         private const val PROGRESS_INTERVAL = 25
         private const val MAX_CONSECUTIVE_FAILURES = 3
         private const val ITERATIONS_PER_LOG_CLEAR = 2000
+        // Drop-rebind: how long to let the (forced-failing) spawn stay in flight
+        // between bind A and unbind(remove=true) A, so the rebind B lands while the
+        // record is still "starting" and takes the reuse path.
+        private const val DROPREBIND_INFLIGHT_MS = 300L
     }
 }
